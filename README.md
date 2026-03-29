@@ -2,11 +2,7 @@
 
 A fast, event-driven workspace indicator for [Waybar](https://github.com/Alexays/Waybar) and [niri](https://github.com/YaLTeR/niri).
 
-<img width="2880" height="1800" alt="image" src="https://github.com/user-attachments/assets/5b1debef-c18d-4ae9-9a82-5655dd4fc913" />
-
-
-https://github.com/user-attachments/assets/7fb1fea8-ff79-489a-80f3-63fb1a20cf32
-
+<img width="960" height="600" alt="niri-workspaces-rs demo" src="assets/demo.gif" />
 
 ## Features
 
