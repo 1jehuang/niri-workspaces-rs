@@ -1,7 +1,11 @@
-use niri_ipc::socket::Socket;
+use niri_ipc::socket::SOCKET_PATH_ENV;
 use niri_ipc::{Event, Request, Response, Window, Workspace};
 use std::collections::HashMap;
+use std::env;
 use std::fs;
+use std::io::{BufRead, BufReader, Write};
+use std::net::Shutdown;
+use std::os::unix::net::UnixStream;
 
 fn main() {
     loop {
@@ -13,13 +17,15 @@ fn main() {
 }
 
 fn run_daemon() -> Result<(), Box<dyn std::error::Error>> {
-    // Get initial state and output
-    let (workspaces, windows) = fetch_state()?;
-    output_status(&workspaces, &windows);
+    // Subscribe to event stream. Niri sends the full current workspace/window
+    // state up-front, then incremental updates. Keeping that state locally
+    // avoids opening fresh IPC sockets on every focus/workspace event, which
+    // adds visible latency to Waybar previews/hover updates.
+    let mut stream = connect_to_niri()?;
+    send_request(&mut stream, &Request::EventStream)?;
 
-    // Subscribe to event stream
-    let mut socket = Socket::connect()?;
-    let reply = socket.send(Request::EventStream)?;
+    let mut reader = BufReader::new(stream);
+    let reply: Result<Response, String> = read_json_line(&mut reader)?;
 
     match reply {
         Ok(Response::Handled) => {}
@@ -27,45 +33,145 @@ fn run_daemon() -> Result<(), Box<dyn std::error::Error>> {
         Err(msg) => return Err(msg.into()),
     }
 
-    let mut read_event = socket.read_events();
+    let _ = reader.get_mut().shutdown(Shutdown::Write);
+    let mut workspaces = Vec::new();
+    let mut windows = Vec::new();
+    let mut have_workspaces = false;
+    let mut have_windows = false;
 
     loop {
-        let event = read_event()?;
+        let Some(event) = read_next_known_event(&mut reader)? else {
+            continue;
+        };
 
-        // Only update on relevant events
+        let mut should_output = true;
         match event {
-            Event::WorkspacesChanged { .. }
-            | Event::WorkspaceActivated { .. }
-            | Event::WindowsChanged { .. }
-            | Event::WindowOpenedOrChanged { .. }
-            | Event::WindowClosed { .. }
-            | Event::WindowFocusChanged { .. } => {
-                if let Ok((ws, win)) = fetch_state() {
-                    output_status(&ws, &win);
+            Event::WorkspacesChanged {
+                workspaces: new_workspaces,
+            } => {
+                workspaces = new_workspaces;
+                have_workspaces = true;
+            }
+            Event::WorkspaceActivated { id, focused } => {
+                let output = workspaces
+                    .iter()
+                    .find(|ws| ws.id == id)
+                    .and_then(|ws| ws.output.clone());
+
+                for ws in &mut workspaces {
+                    if ws.id == id {
+                        ws.is_active = true;
+                        ws.is_focused = focused;
+                    } else {
+                        if ws.output == output {
+                            ws.is_active = false;
+                        }
+                        if focused {
+                            ws.is_focused = false;
+                        }
+                    }
                 }
             }
-            _ => {}
+            Event::WorkspaceActiveWindowChanged {
+                workspace_id,
+                active_window_id,
+            } => {
+                if let Some(ws) = workspaces.iter_mut().find(|ws| ws.id == workspace_id) {
+                    ws.active_window_id = active_window_id;
+                }
+            }
+            Event::WorkspaceUrgencyChanged { id, urgent } => {
+                if let Some(ws) = workspaces.iter_mut().find(|ws| ws.id == id) {
+                    ws.is_urgent = urgent;
+                }
+            }
+            Event::WindowsChanged {
+                windows: new_windows,
+            } => {
+                windows = new_windows;
+                have_windows = true;
+            }
+            Event::WindowOpenedOrChanged { window } => {
+                if window.is_focused {
+                    for win in &mut windows {
+                        win.is_focused = false;
+                    }
+                }
+
+                if let Some(existing) = windows.iter_mut().find(|win| win.id == window.id) {
+                    *existing = window;
+                } else {
+                    windows.push(window);
+                }
+            }
+            Event::WindowClosed { id } => {
+                windows.retain(|win| win.id != id);
+                for ws in &mut workspaces {
+                    if ws.active_window_id == Some(id) {
+                        ws.active_window_id = None;
+                    }
+                }
+            }
+            Event::WindowFocusChanged { id } => {
+                for win in &mut windows {
+                    win.is_focused = Some(win.id) == id;
+                }
+            }
+            Event::WindowLayoutsChanged { changes } => {
+                for (id, layout) in changes {
+                    if let Some(win) = windows.iter_mut().find(|win| win.id == id) {
+                        win.layout = layout;
+                    }
+                }
+            }
+            _ => should_output = false,
+        }
+
+        if should_output && have_workspaces && have_windows {
+            output_status(&workspaces, &windows);
         }
     }
 }
 
-fn fetch_state() -> Result<(Vec<Workspace>, Vec<Window>), Box<dyn std::error::Error>> {
-    let mut socket = Socket::connect()?;
+fn connect_to_niri() -> Result<UnixStream, Box<dyn std::error::Error>> {
+    let socket_path = env::var_os(SOCKET_PATH_ENV).ok_or_else(|| {
+        format!("{SOCKET_PATH_ENV} is not set, are you running this within niri?")
+    })?;
+    Ok(UnixStream::connect(socket_path)?)
+}
 
-    let workspaces = match socket.send(Request::Workspaces)? {
-        Ok(Response::Workspaces(ws)) => ws,
-        Ok(other) => return Err(format!("Unexpected: {:?}", other).into()),
-        Err(msg) => return Err(msg.into()),
-    };
+fn send_request(
+    stream: &mut UnixStream,
+    request: &Request,
+) -> Result<(), Box<dyn std::error::Error>> {
+    serde_json::to_writer(&mut *stream, request)?;
+    stream.write_all(b"\n")?;
+    stream.flush()?;
+    Ok(())
+}
 
-    let mut socket = Socket::connect()?;
-    let windows = match socket.send(Request::Windows)? {
-        Ok(Response::Windows(ws)) => ws,
-        Ok(other) => return Err(format!("Unexpected: {:?}", other).into()),
-        Err(msg) => return Err(msg.into()),
-    };
+fn read_json_line<T: serde::de::DeserializeOwned>(
+    reader: &mut BufReader<UnixStream>,
+) -> Result<T, Box<dyn std::error::Error>> {
+    let mut line = String::new();
+    if reader.read_line(&mut line)? == 0 {
+        return Err("niri IPC socket closed".into());
+    }
+    Ok(serde_json::from_str(&line)?)
+}
 
-    Ok((workspaces, windows))
+fn read_next_known_event(
+    reader: &mut BufReader<UnixStream>,
+) -> Result<Option<Event>, Box<dyn std::error::Error>> {
+    let mut line = String::new();
+    if reader.read_line(&mut line)? == 0 {
+        return Err("niri IPC event stream closed".into());
+    }
+
+    match serde_json::from_str(&line) {
+        Ok(event) => Ok(Some(event)),
+        Err(_err) => Ok(None),
+    }
 }
 
 fn output_status(workspaces: &[Workspace], windows: &[Window]) {
